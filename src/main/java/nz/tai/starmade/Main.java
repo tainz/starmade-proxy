@@ -24,11 +24,16 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * Frontend listen: TCP/UDP  localhost:4243
  * Backend target:  TCP/UDP  localhost:4242
+ *
+ * Improvements:
+ * - Fixed race condition causing 10s login delay
+ * - Added backpressure handling for slow receivers
+ * - Optimized TCP settings (TCP_NODELAY, SO_KEEPALIVE)
  */
 public class Main {
 
     // TCP config
-    private static final String BACKEND_HOST = "localhost";
+    private static final String BACKEND_HOST = "starmade.bedrock.games";
     private static final int BACKEND_TCP_PORT = 4242;
     private static final int FRONTEND_TCP_PORT = 4243;
 
@@ -54,6 +59,9 @@ public class Main {
             ServerBootstrap tcpBootstrap = new ServerBootstrap();
             tcpBootstrap.group(bossGroup, workerGroup)
                     .channel(NioServerSocketChannel.class)
+                    .childOption(ChannelOption.TCP_NODELAY, true)
+                    .childOption(ChannelOption.SO_KEEPALIVE, true)
+                    .childOption(ChannelOption.AUTO_READ, true)
                     .childHandler(new ChannelInitializer<SocketChannel>() {
                         @Override
                         protected void initChannel(SocketChannel ch) {
@@ -117,6 +125,7 @@ public class Main {
      * Inbound handler on the frontend TCP channel:
      * - Creates a backend TCP connection on first use
      * - Forwards all frames (with length prefix) to backend
+     * - Implements backpressure handling to prevent memory exhaustion
      */
     private static class TcpFrontendHandler extends ChannelInboundHandlerAdapter {
 
@@ -131,17 +140,26 @@ public class Main {
 
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
+            // CRITICAL FIX: Stop reading from client until backend is ready
+            // This prevents the race condition causing 10s login delay
+            final Channel frontendChannel = ctx.channel();
+            frontendChannel.config().setAutoRead(false);
+
             // Create outbound connection to backend using same event loop
             Bootstrap b = new Bootstrap();
             b.group(ctx.channel().eventLoop())
                     .channel(NioSocketChannel.class)
                     .option(ChannelOption.TCP_NODELAY, true)
+                    .option(ChannelOption.SO_KEEPALIVE, true)
+                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
                     .handler(new ChannelInitializer<SocketChannel>() {
                         @Override
                         protected void initChannel(SocketChannel ch) {
                             ChannelPipeline p = ch.pipeline();
+                            // Backpressure: pause reading from frontend when backend is not writable
+                            p.addLast("backpressure", new BackpressureHandler(frontendChannel));
                             // Backend side: treat stream as opaque, no framing; just relay bytes
-                            p.addLast("tcpBackend", new TcpBackendHandler(ctx.channel()));
+                            p.addLast("tcpBackend", new TcpBackendHandler(frontendChannel));
                         }
                     });
 
@@ -149,10 +167,14 @@ public class Main {
             backendChannel = f.channel();
 
             f.addListener((ChannelFutureListener) future -> {
-                if (!future.isSuccess()) {
-                    System.err.println("Failed to connect to backend TCP " +
-                            remoteHost + ":" + remotePort);
-                    ctx.close();
+                if (future.isSuccess()) {
+                    // Backend connected successfully - NOW start reading from client
+                    frontendChannel.config().setAutoRead(true);
+                    System.out.println("[TCP] Backend connection established for " + frontendChannel.remoteAddress());
+                } else {
+                    System.err.println("[TCP] Failed to connect to backend " +
+                            remoteHost + ":" + remotePort + " - " + future.cause().getMessage());
+                    frontendChannel.close();
                 }
             });
         }
@@ -161,7 +183,13 @@ public class Main {
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             Channel backend = backendChannel;
             if (backend != null && backend.isActive()) {
-                backend.writeAndFlush(msg);
+                // Write to backend with backpressure awareness
+                backend.writeAndFlush(msg).addListener((ChannelFutureListener) future -> {
+                    if (!future.isSuccess()) {
+                        System.err.println("[TCP] Failed to write to backend: " + future.cause().getMessage());
+                        ctx.close();
+                    }
+                });
             } else {
                 ReferenceCountUtil.release(msg);
             }
@@ -176,7 +204,7 @@ public class Main {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            cause.printStackTrace();
+            System.err.println("[TCP Frontend] Exception: " + cause.getMessage());
             ctx.close();
         }
     }
@@ -184,6 +212,7 @@ public class Main {
     /**
      * Inbound handler on the backend TCP channel:
      * - Forwards all bytes back to the original client.
+     * - Implements backpressure handling
      */
     private static class TcpBackendHandler extends ChannelInboundHandlerAdapter {
 
@@ -196,7 +225,12 @@ public class Main {
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             if (frontendChannel.isActive()) {
-                frontendChannel.writeAndFlush(msg);
+                frontendChannel.writeAndFlush(msg).addListener((ChannelFutureListener) future -> {
+                    if (!future.isSuccess()) {
+                        System.err.println("[TCP] Failed to write to frontend: " + future.cause().getMessage());
+                        ctx.close();
+                    }
+                });
             } else {
                 ReferenceCountUtil.release(msg);
             }
@@ -211,8 +245,37 @@ public class Main {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            cause.printStackTrace();
+            System.err.println("[TCP Backend] Exception: " + cause.getMessage());
             ctx.close();
+        }
+    }
+
+    /**
+     * Backpressure handler: Controls reading from source channel based on
+     * destination channel writability to prevent memory exhaustion with slow receivers.
+     */
+    private static class BackpressureHandler extends ChannelInboundHandlerAdapter {
+
+        private final Channel sourceChannel;
+
+        BackpressureHandler(Channel sourceChannel) {
+            this.sourceChannel = sourceChannel;
+        }
+
+        @Override
+        public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
+            boolean writable = ctx.channel().isWritable();
+            // When destination becomes non-writable, pause reading from source
+            // When it becomes writable again, resume reading
+            sourceChannel.config().setAutoRead(writable);
+
+            if (!writable) {
+                System.out.println("[Backpressure] Paused reading from " + sourceChannel.remoteAddress());
+            } else {
+                System.out.println("[Backpressure] Resumed reading from " + sourceChannel.remoteAddress());
+            }
+
+            super.channelWritabilityChanged(ctx);
         }
     }
 
@@ -276,7 +339,7 @@ public class Main {
                     }
                 } catch (Exception e) {
                     // Swallow sniffing errors but do not break proxying
-                    e.printStackTrace();
+                    System.err.println("[Login Sniffer] Error: " + e.getMessage());
                 }
 
                 // Pass the original buffer downstream unchanged
@@ -353,8 +416,8 @@ public class Main {
                                 new DatagramPacket(contentCopy, backendAddr)
                         );
                     } else {
-                        System.err.println("Failed to connect to backend UDP " +
-                                backendAddr + " for client " + clientAddr);
+                        System.err.println("[UDP] Failed to connect to backend " +
+                                backendAddr + " for client " + clientAddr + ": " + future.cause().getMessage());
                         contentCopy.release();
                         clientToBackend.remove(clientAddr, future.channel());
                         backendToClient.remove(future.channel().id());
@@ -364,14 +427,17 @@ public class Main {
                 // Backend channel already exists; just forward
                 backendChannel.writeAndFlush(
                         new DatagramPacket(packet.content().retainedDuplicate(), backendAddr)
-                );
+                ).addListener((ChannelFutureListener) future -> {
+                    if (!future.isSuccess()) {
+                        System.err.println("[UDP] Failed to forward packet: " + future.cause().getMessage());
+                    }
+                });
             }
         }
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            cause.printStackTrace();
-            ctx.close();
+            System.err.println("[UDP Frontend] Exception: " + cause.getMessage());
         }
     }
 
@@ -401,7 +467,11 @@ public class Main {
             if (clientAddr != null && proxyChannel.isActive()) {
                 proxyChannel.writeAndFlush(
                         new DatagramPacket(packet.content().retainedDuplicate(), clientAddr)
-                );
+                ).addListener((ChannelFutureListener) future -> {
+                    if (!future.isSuccess()) {
+                        System.err.println("[UDP] Failed to forward packet to client: " + future.cause().getMessage());
+                    }
+                });
             }
         }
 
@@ -415,7 +485,7 @@ public class Main {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            cause.printStackTrace();
+            System.err.println("[UDP Backend] Exception: " + cause.getMessage());
             ctx.close();
         }
     }
