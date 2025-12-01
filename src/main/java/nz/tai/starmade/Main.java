@@ -2,492 +2,167 @@ package nz.tai.starmade;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
-import io.netty.buffer.ByteBuf;
-import io.netty.channel.*;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.DatagramChannel;
-import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
-import io.netty.util.ReferenceCountUtil;
+import nz.tai.starmade.config.ProxyConfig;
+import nz.tai.starmade.protocol.LoginSnifferHandler;
+import nz.tai.starmade.tcp.TcpFrontendHandler;
+import nz.tai.starmade.udp.UdpFrontendHandler;
+import nz.tai.starmade.udp.UdpSessionManager;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
- * StarMade TCP+UDP proxy proof-of-concept using Netty 4.
+ * StarMade TCP+UDP proxy using Netty 4.2.x.
  *
- * Frontend listen: TCP/UDP  localhost:4243
- * Backend target:  TCP/UDP  localhost:4242
+ * <p>This proxy forwards traffic between a frontend port (client-facing) and backend port
+ * (StarMade server) for both TCP and UDP protocols. It includes:
+ * <ul>
+ *   <li>Fixed race condition causing 10s login delay via AUTO_READ control</li>
+ *   <li>Backpressure handling for slow receivers</li>
+ *   <li>Optimized TCP settings (TCP_NODELAY, SO_KEEPALIVE)</li>
+ *   <li>Login packet sniffing for monitoring</li>
+ * </ul>
  *
- * Improvements:
- * - Fixed race condition causing 10s login delay
- * - Added backpressure handling for slow receivers
- * - Optimized TCP settings (TCP_NODELAY, SO_KEEPALIVE)
+ * <p>Configuration is loaded from environment variables with sensible defaults.
+ * See {@link ProxyConfig} for available options.
  */
-public class Main {
+public final class Main {
+    private static final Logger logger = LoggerFactory.getLogger(Main.class);
+    private static final int BOSS_THREADS = 1;
+    private static final long SHUTDOWN_QUIET_PERIOD_SECONDS = 2;
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 15;
 
-    // TCP config
-    private static final String BACKEND_HOST = "127.0.0.1";
-    private static final int BACKEND_TCP_PORT = 4242;
-    private static final int FRONTEND_TCP_PORT = 4243;
+    // Frame decoder constants
+    private static final int LENGTH_FIELD_OFFSET = 0;
+    private static final int LENGTH_FIELD_LENGTH = 4;
+    private static final int LENGTH_ADJUSTMENT = 0;
+    private static final int INITIAL_BYTES_TO_STRIP = 0;
 
-    // UDP config
-    private static final int BACKEND_UDP_PORT = 4242;
-    private static final int FRONTEND_UDP_PORT = 4243;
-
-    // Protocol constants
-    private static final byte SIGNATURE = 0x2A; // 42
-    private static final byte LOGIN_COMMAND_ID = 0;
-    private static final int MAX_FRAME_SIZE = 10 * 1024 * 1024; // 10 MB
+    private Main() {
+        // Utility class
+    }
 
     public static void main(String[] args) throws InterruptedException {
-        // TCP event loops
-        EventLoopGroup bossGroup = new NioEventLoopGroup(1);
-        EventLoopGroup workerGroup = new NioEventLoopGroup();
+        var config = ProxyConfig.fromEnvironment();
+        logger.info("Starting StarMade proxy with config: {}", config);
 
-        // UDP event loop
-        EventLoopGroup udpGroup = new NioEventLoopGroup(1);
+        var bossGroup = new MultiThreadIoEventLoopGroup(BOSS_THREADS, NioIoHandler.newFactory());
+        var workerGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+        var udpGroup = new MultiThreadIoEventLoopGroup(BOSS_THREADS, NioIoHandler.newFactory());
+
+        // Register shutdown hook for graceful termination
+        registerShutdownHook(bossGroup, workerGroup, udpGroup);
 
         try {
-            // Start TCP proxy
-            ServerBootstrap tcpBootstrap = new ServerBootstrap();
-            tcpBootstrap.group(bossGroup, workerGroup)
-                    .channel(NioServerSocketChannel.class)
-                    .childOption(ChannelOption.TCP_NODELAY, true)
-                    .childOption(ChannelOption.SO_KEEPALIVE, true)
-                    .childOption(ChannelOption.AUTO_READ, true)
-                    .childHandler(new ChannelInitializer<SocketChannel>() {
-                        @Override
-                        protected void initChannel(SocketChannel ch) {
-                            ChannelPipeline p = ch.pipeline();
-                            // TCP framing: 4-byte length field, big-endian (client -> server)
-                            p.addLast("frameDecoder",
-                                    new LengthFieldBasedFrameDecoder(
-                                            MAX_FRAME_SIZE,
-                                            0, // length field offset
-                                            4, // length field length
-                                            0, // length adjustment
-                                            0  // do NOT strip length; keep it for forwarding
-                                    ));
-                            // Login sniffer (does not modify buffer, only peeks)
-                            p.addLast("loginSniffer", new LoginSnifferHandler());
-                            // Forward everything to backend
-                            p.addLast("tcpFrontend", new TcpFrontendHandler(BACKEND_HOST, BACKEND_TCP_PORT));
-                        }
-                    });
+            var tcpFuture = startTcpProxy(config, bossGroup, workerGroup);
+            var udpFuture = startUdpProxy(config, udpGroup);
 
-            ChannelFuture tcpBindFuture = tcpBootstrap.bind(FRONTEND_TCP_PORT).sync();
-            System.out.println("TCP proxy listening on localhost:" + FRONTEND_TCP_PORT);
+            logger.info("Proxy started successfully");
 
-            // Shared UDP mapping: client address -> backend channel
-            Map<InetSocketAddress, Channel> clientToBackend = new ConcurrentHashMap<>();
-            // Reverse mapping: backend channel id -> client address
-            Map<ChannelId, InetSocketAddress> backendToClient = new ConcurrentHashMap<>();
-
-            // Start UDP proxy
-            Bootstrap udpBootstrap = new Bootstrap();
-            udpBootstrap.group(udpGroup)
-                    .channel(NioDatagramChannel.class)
-                    .option(ChannelOption.SO_REUSEADDR, true)
-                    .handler(new ChannelInitializer<DatagramChannel>() {
-                        @Override
-                        protected void initChannel(DatagramChannel ch) {
-                            ChannelPipeline p = ch.pipeline();
-                            p.addLast("udpFrontend", new UdpFrontendHandler(
-                                    BACKEND_HOST,
-                                    BACKEND_UDP_PORT,
-                                    clientToBackend,
-                                    backendToClient
-                            ));
-                        }
-                    });
-
-            ChannelFuture udpBindFuture = udpBootstrap.bind(FRONTEND_UDP_PORT).sync();
-            System.out.println("UDP proxy listening on localhost:" + FRONTEND_UDP_PORT);
-
-            // Wait until the proxy channels are closed.
-            tcpBindFuture.channel().closeFuture().sync();
-            udpBindFuture.channel().closeFuture().sync();
+            // Wait until both proxies are closed
+            tcpFuture.channel().closeFuture().sync();
+            udpFuture.channel().closeFuture().sync();
         } finally {
-            bossGroup.shutdownGracefully();
-            workerGroup.shutdownGracefully();
-            udpGroup.shutdownGracefully();
+            shutdownGracefully(bossGroup, workerGroup, udpGroup);
         }
     }
 
-    /**
-     * Inbound handler on the frontend TCP channel:
-     * - Creates a backend TCP connection on first use
-     * - Forwards all frames (with length prefix) to backend
-     * - Implements backpressure handling to prevent memory exhaustion
-     */
-    private static class TcpFrontendHandler extends ChannelInboundHandlerAdapter {
+    private static ChannelFuture startTcpProxy(
+            ProxyConfig config,
+            EventLoopGroup bossGroup,
+            EventLoopGroup workerGroup) throws InterruptedException {
 
-        private final String remoteHost;
-        private final int remotePort;
-        private volatile Channel backendChannel;
+        var bootstrap = new ServerBootstrap();
+        bootstrap.group(bossGroup, workerGroup)
+                .channel(NioServerSocketChannel.class)
+                .childOption(ChannelOption.TCP_NODELAY, true)
+                .childOption(ChannelOption.SO_KEEPALIVE, true)
+                .childOption(ChannelOption.AUTO_READ, true)
+                .childHandler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    protected void initChannel(SocketChannel ch) {
+                        ChannelPipeline pipeline = ch.pipeline();
 
-        TcpFrontendHandler(String remoteHost, int remotePort) {
-            this.remoteHost = remoteHost;
-            this.remotePort = remotePort;
-        }
+                        // Frame decoder: 4-byte length prefix, keep length field for forwarding
+                        pipeline.addLast("frameDecoder",
+                                new LengthFieldBasedFrameDecoder(
+                                        config.maxFrameSize(),
+                                        LENGTH_FIELD_OFFSET,
+                                        LENGTH_FIELD_LENGTH,
+                                        LENGTH_ADJUSTMENT,
+                                        INITIAL_BYTES_TO_STRIP
+                                ));
 
-        @Override
-        public void channelActive(ChannelHandlerContext ctx) {
-            // CRITICAL FIX: Stop reading from client until backend is ready
-            // This prevents the race condition causing 10s login delay
-            final Channel frontendChannel = ctx.channel();
-            frontendChannel.config().setAutoRead(false);
+                        // Login packet sniffer (read-only, does not modify buffer)
+                        pipeline.addLast("loginSniffer", new LoginSnifferHandler(config));
 
-            // Create outbound connection to backend using same event loop
-            Bootstrap b = new Bootstrap();
-            b.group(ctx.channel().eventLoop())
-                    .channel(NioSocketChannel.class)
-                    .option(ChannelOption.TCP_NODELAY, true)
-                    .option(ChannelOption.SO_KEEPALIVE, true)
-                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
-                    .handler(new ChannelInitializer<SocketChannel>() {
-                        @Override
-                        protected void initChannel(SocketChannel ch) {
-                            ChannelPipeline p = ch.pipeline();
-                            // Backpressure: pause reading from frontend when backend is not writable
-                            p.addLast("backpressure", new BackpressureHandler(frontendChannel));
-                            // Backend side: treat stream as opaque, no framing; just relay bytes
-                            p.addLast("tcpBackend", new TcpBackendHandler(frontendChannel));
-                        }
-                    });
-
-            ChannelFuture f = b.connect(remoteHost, remotePort);
-            backendChannel = f.channel();
-
-            f.addListener((ChannelFutureListener) future -> {
-                if (future.isSuccess()) {
-                    // Backend connected successfully - NOW start reading from client
-                    frontendChannel.config().setAutoRead(true);
-                    System.out.println("[TCP] Backend connection established for " + frontendChannel.remoteAddress());
-                } else {
-                    System.err.println("[TCP] Failed to connect to backend " +
-                            remoteHost + ":" + remotePort + " - " + future.cause().getMessage());
-                    frontendChannel.close();
-                }
-            });
-        }
-
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            Channel backend = backendChannel;
-            if (backend != null && backend.isActive()) {
-                // Write to backend with backpressure awareness
-                backend.writeAndFlush(msg).addListener((ChannelFutureListener) future -> {
-                    if (!future.isSuccess()) {
-                        System.err.println("[TCP] Failed to write to backend: " + future.cause().getMessage());
-                        ctx.close();
+                        // Forward to backend
+                        pipeline.addLast("tcpFrontend",
+                                new TcpFrontendHandler(config.backendHost(), config.backendTcpPort()));
                     }
                 });
-            } else {
-                System.err.println("[TCP] WARNING: Dropped packet because backend not ready! (Race condition persisted)");
-                ReferenceCountUtil.release(msg);
-            }
-        }
 
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            if (backendChannel != null) {
-                backendChannel.close();
-            }
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            System.err.println("[TCP Frontend] Exception: " + cause.getMessage());
-            ctx.close();
-        }
+        var future = bootstrap.bind(config.frontendTcpPort()).sync();
+        logger.info("TCP proxy listening on localhost:{}", config.frontendTcpPort());
+        return future;
     }
 
-    /**
-     * Inbound handler on the backend TCP channel:
-     * - Forwards all bytes back to the original client.
-     * - Implements backpressure handling
-     */
-    private static class TcpBackendHandler extends ChannelInboundHandlerAdapter {
+    private static ChannelFuture startUdpProxy(
+            ProxyConfig config,
+            EventLoopGroup udpGroup) throws InterruptedException {
 
-        private final Channel frontendChannel;
+        var sessionManager = new UdpSessionManager();
 
-        TcpBackendHandler(Channel frontendChannel) {
-            this.frontendChannel = frontendChannel;
-        }
-
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            if (frontendChannel.isActive()) {
-                frontendChannel.writeAndFlush(msg).addListener((ChannelFutureListener) future -> {
-                    if (!future.isSuccess()) {
-                        System.err.println("[TCP] Failed to write to frontend: " + future.cause().getMessage());
-                        ctx.close();
+        var bootstrap = new Bootstrap();
+        bootstrap.group(udpGroup)
+                .channel(NioDatagramChannel.class)
+                .option(ChannelOption.SO_REUSEADDR, true)
+                .handler(new ChannelInitializer<DatagramChannel>() {
+                    @Override
+                    protected void initChannel(DatagramChannel ch) {
+                        ch.pipeline().addLast("udpFrontend",
+                                new UdpFrontendHandler(
+                                        config.backendHost(),
+                                        config.backendUdpPort(),
+                                        sessionManager
+                                ));
                     }
                 });
-            } else {
-                ReferenceCountUtil.release(msg);
-            }
-        }
 
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            if (frontendChannel.isActive()) {
-                frontendChannel.close();
-            }
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            System.err.println("[TCP Backend] Exception: " + cause.getMessage());
-            ctx.close();
-        }
+        var future = bootstrap.bind(config.frontendUdpPort()).sync();
+        logger.info("UDP proxy listening on localhost:{}", config.frontendUdpPort());
+        return future;
     }
 
-    /**
-     * Backpressure handler: Controls reading from source channel based on
-     * destination channel writability to prevent memory exhaustion with slow receivers.
-     */
-    private static class BackpressureHandler extends ChannelInboundHandlerAdapter {
-
-        private final Channel sourceChannel;
-
-        BackpressureHandler(Channel sourceChannel) {
-            this.sourceChannel = sourceChannel;
-        }
-
-        @Override
-        public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
-            boolean writable = ctx.channel().isWritable();
-            // When destination becomes non-writable, pause reading from source
-            // When it becomes writable again, resume reading
-            sourceChannel.config().setAutoRead(writable);
-
-            if (!writable) {
-                System.out.println("[Backpressure] Paused reading from " + sourceChannel.remoteAddress());
-            } else {
-                System.out.println("[Backpressure] Resumed reading from " + sourceChannel.remoteAddress());
-            }
-
-            super.channelWritabilityChanged(ctx);
-        }
+    private static void registerShutdownHook(EventLoopGroup... groups) {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            logger.info("Shutdown hook triggered, closing event loops...");
+            shutdownGracefully(groups);
+        }, "shutdown-hook"));
     }
 
-    /**
-     * Login sniffer:
-     * - Runs after framing, sees full packet (length + header + payload).
-     * - Peeks into the buffer without changing readerIndex, so forwarding stays intact.
-     * - If commandId == 0, parses param 0 as username and logs it.
-     */
-    @ChannelHandler.Sharable
-    private static class LoginSnifferHandler extends ChannelInboundHandlerAdapter {
-
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            if (msg instanceof ByteBuf) {
-                ByteBuf buf = (ByteBuf) msg;
-                try {
-                    // Need at least: 4-byte length + 5-byte header
-                    if (buf.readableBytes() >= 4 + 5) {
-                        int baseIdx = buf.readerIndex();
-
-                        // Length (we don't really need it for sniffing)
-                        int frameLength = buf.getInt(baseIdx);
-
-                        int headerStart = baseIdx + 4;
-                        short signature = buf.getUnsignedByte(headerStart);
-
-                        if (signature == (SIGNATURE & 0xFF)) {
-                            // short packetId = buf.getShort(headerStart + 1); // not used
-                            short commandId = buf.getUnsignedByte(headerStart + 3);
-
-                            if (commandId == (LOGIN_COMMAND_ID & 0xFF)) {
-                                // Login payload begins after 5-byte header
-                                int payloadStart = headerStart + 5;
-                                int minSize = (payloadStart - baseIdx) + 4; // paramCount
-
-                                if (buf.readableBytes() >= minSize) {
-                                    int paramCount = buf.getInt(payloadStart);
-                                    if (paramCount > 0) {
-                                        int p0TypeIdx = payloadStart + 4;
-                                        if (buf.readableBytes() >= (p0TypeIdx - baseIdx) + 1 + 2) {
-                                            int p0Type = buf.getUnsignedByte(p0TypeIdx);
-                                            if (p0Type == 4) { // string
-                                                int p0LenIdx = p0TypeIdx + 1;
-                                                int strLen = buf.getUnsignedShort(p0LenIdx);
-
-                                                int totalNeeded = (p0LenIdx - baseIdx) + 2 + strLen;
-                                                if (buf.readableBytes() >= totalNeeded) {
-                                                    int strStart = p0LenIdx + 2;
-                                                    byte[] nameBytes = new byte[strLen];
-                                                    buf.getBytes(strStart, nameBytes);
-                                                    String username = new String(nameBytes, StandardCharsets.UTF_8);
-                                                    System.out.println("[TCP] Login Detected: " + username);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                    // Swallow sniffing errors but do not break proxying
-                    System.err.println("[Login Sniffer] Error: " + e.getMessage());
-                }
-
-                // Pass the original buffer downstream unchanged
-                ctx.fireChannelRead(msg);
-            } else {
-                ctx.fireChannelRead(msg);
+    private static void shutdownGracefully(EventLoopGroup... groups) {
+        for (var group : groups) {
+            if (group != null) {
+                group.shutdownGracefully(
+                        SHUTDOWN_QUIET_PERIOD_SECONDS,
+                        SHUTDOWN_TIMEOUT_SECONDS,
+                        TimeUnit.SECONDS
+                );
             }
-        }
-    }
-
-    /**
-     * UDP frontend handler:
-     * - Receives packets from clients on the proxy port.
-     * - Maintains a mapping from client address to backend DatagramChannel.
-     * - Forwards packets to backend using a per-client backend channel.
-     */
-    private static class UdpFrontendHandler extends SimpleChannelInboundHandler<DatagramPacket> {
-
-        private final String backendHost;
-        private final int backendPort;
-        private final Map<InetSocketAddress, Channel> clientToBackend;
-        private final Map<ChannelId, InetSocketAddress> backendToClient;
-
-        UdpFrontendHandler(String backendHost,
-                           int backendPort,
-                           Map<InetSocketAddress, Channel> clientToBackend,
-                           Map<ChannelId, InetSocketAddress> backendToClient) {
-            this.backendHost = backendHost;
-            this.backendPort = backendPort;
-            this.clientToBackend = clientToBackend;
-            this.backendToClient = backendToClient;
-        }
-
-        @Override
-        protected void channelRead0(ChannelHandlerContext ctx, DatagramPacket packet) {
-            InetSocketAddress clientAddr = packet.sender();
-            Channel proxyChannel = ctx.channel(); // the listening UDP channel
-            InetSocketAddress backendAddr = new InetSocketAddress(backendHost, backendPort);
-
-            // Get or create backend channel for this client
-            Channel backendChannel = clientToBackend.get(clientAddr);
-
-            if (backendChannel == null || !backendChannel.isActive()) {
-                // Create new backend DatagramChannel for this client
-                Bootstrap b = new Bootstrap();
-                b.group(proxyChannel.eventLoop())
-                        .channel(NioDatagramChannel.class)
-                        .option(ChannelOption.SO_REUSEADDR, true)
-                        .handler(new ChannelInitializer<DatagramChannel>() {
-                            @Override
-                            protected void initChannel(DatagramChannel ch) {
-                                ch.pipeline().addLast("udpBackend",
-                                        new UdpBackendHandler(
-                                                proxyChannel,
-                                                clientToBackend,
-                                                backendToClient
-                                        ));
-                            }
-                        });
-
-                ChannelFuture cf = b.connect(backendAddr);
-                backendChannel = cf.channel();
-
-                // Store mappings preemptively (will be removed on failure/close)
-                clientToBackend.put(clientAddr, backendChannel);
-                backendToClient.put(backendChannel.id(), clientAddr);
-
-                // Forward the current packet once the backend is connected
-                ByteBuf contentCopy = packet.content().retainedDuplicate();
-
-                cf.addListener((ChannelFutureListener) future -> {
-                    if (future.isSuccess()) {
-                        future.channel().writeAndFlush(
-                                new DatagramPacket(contentCopy, backendAddr)
-                        );
-                    } else {
-                        System.err.println("[UDP] Failed to connect to backend " +
-                                backendAddr + " for client " + clientAddr + ": " + future.cause().getMessage());
-                        contentCopy.release();
-                        clientToBackend.remove(clientAddr, future.channel());
-                        backendToClient.remove(future.channel().id());
-                    }
-                });
-            } else {
-                // Backend channel already exists; just forward
-                backendChannel.writeAndFlush(
-                        new DatagramPacket(packet.content().retainedDuplicate(), backendAddr)
-                ).addListener((ChannelFutureListener) future -> {
-                    if (!future.isSuccess()) {
-                        System.err.println("[UDP] Failed to forward packet: " + future.cause().getMessage());
-                    }
-                });
-            }
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            System.err.println("[UDP Frontend] Exception: " + cause.getMessage());
-        }
-    }
-
-    /**
-     * UDP backend handler:
-     * - Receives packets from backend server.
-     * - Looks up the original client address and forwards packets back.
-     * - Cleans up mappings when backend channel closes.
-     */
-    private static class UdpBackendHandler extends SimpleChannelInboundHandler<DatagramPacket> {
-
-        private final Channel proxyChannel;
-        private final Map<InetSocketAddress, Channel> clientToBackend;
-        private final Map<ChannelId, InetSocketAddress> backendToClient;
-
-        UdpBackendHandler(Channel proxyChannel,
-                          Map<InetSocketAddress, Channel> clientToBackend,
-                          Map<ChannelId, InetSocketAddress> backendToClient) {
-            this.proxyChannel = proxyChannel;
-            this.clientToBackend = clientToBackend;
-            this.backendToClient = backendToClient;
-        }
-
-        @Override
-        protected void channelRead0(ChannelHandlerContext ctx, DatagramPacket packet) {
-            InetSocketAddress clientAddr = backendToClient.get(ctx.channel().id());
-            if (clientAddr != null && proxyChannel.isActive()) {
-                proxyChannel.writeAndFlush(
-                        new DatagramPacket(packet.content().retainedDuplicate(), clientAddr)
-                ).addListener((ChannelFutureListener) future -> {
-                    if (!future.isSuccess()) {
-                        System.err.println("[UDP] Failed to forward packet to client: " + future.cause().getMessage());
-                    }
-                });
-            }
-        }
-
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            InetSocketAddress clientAddr = backendToClient.remove(ctx.channel().id());
-            if (clientAddr != null) {
-                clientToBackend.remove(clientAddr, ctx.channel());
-            }
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            System.err.println("[UDP Backend] Exception: " + cause.getMessage());
-            ctx.close();
         }
     }
 }
