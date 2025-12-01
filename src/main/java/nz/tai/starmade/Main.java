@@ -33,7 +33,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class Main {
 
     // TCP config
-    private static final String BACKEND_HOST = "starmade.bedrock.games";
+    private static final String BACKEND_HOST = "127.0.0.1";
     private static final int BACKEND_TCP_PORT = 4242;
     private static final int FRONTEND_TCP_PORT = 4243;
 
@@ -191,6 +191,7 @@ public class Main {
                     }
                 });
             } else {
+                System.err.println("[TCP] WARNING: Dropped packet because backend not ready! (Race condition persisted)");
                 ReferenceCountUtil.release(msg);
             }
         }
